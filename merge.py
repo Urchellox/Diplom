@@ -1,13 +1,12 @@
-import os
 import glob
 import pandas as pd
 
 SEP = ";"
 
-# Кого хотим в core (логические имена)
-CORE_LOGICAL = ["EURUSD", "USDKZT", "DXY", "BRENT", "VIX"]  # можешь потом убрать SP500 или VIX
+# Какие колонки хотим видеть в итоговом core-датасете
+CORE_LOGICAL = ["EURUSD", "USDKZT", "EURKZT", "DXY", "BRENT", "VIX"]
 
-# Синонимы на случай разных названий столбцов
+# Синонимы названий
 ALIASES = {
     "EURUSD": ["EURUSD", "EURUSD=X"],
     "USDKZT": ["USDKZT", "USDKZT=X"],
@@ -17,17 +16,20 @@ ALIASES = {
 }
 
 def find_csv_candidates():
-    # берём все csv в текущей папке, кроме новостного
-    files = [f for f in glob.glob("*.csv") if "news" not in f.lower()]
-    return files
+    # Берём все CSV в текущей папке, кроме новостных
+    return [f for f in glob.glob("*.csv") if "news" not in f.lower()]
 
 def load_any_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, sep=SEP)
 
-    # приводим дату: либо есть колонка date, либо первая колонка — дата
+    # Приводим дату
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).sort_values("date").set_index("date")
+    elif "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
+        df.index.name = "date"
     else:
         first = df.columns[0]
         dt = pd.to_datetime(df[first], errors="coerce")
@@ -36,7 +38,6 @@ def load_any_csv(path: str) -> pd.DataFrame:
             df = df.dropna(subset=[first]).sort_values(first).set_index(first)
             df.index.name = "date"
         else:
-            # fallback: пробуем как index_col=0
             df2 = pd.read_csv(path, sep=SEP, index_col=0)
             df2.index = pd.to_datetime(df2.index, errors="coerce")
             df2 = df2.dropna()
@@ -54,9 +55,10 @@ def pick_col(df: pd.DataFrame, logical: str):
 def main():
     csvs = find_csv_candidates()
     if not csvs:
-        raise FileNotFoundError("В папке нет CSV файлов (кроме news). Сохрани свои датасеты в эту папку.")
+        raise FileNotFoundError(
+            "В папке нет CSV файлов (кроме news). Сохрани свои датасеты в эту папку."
+        )
 
-    # Загружаем все кандидаты
     loaded = []
     for f in csvs:
         try:
@@ -66,48 +68,61 @@ def main():
             print(f"Skip {f}: {e}")
 
     if not loaded:
-        raise RuntimeError("Не удалось прочитать ни один CSV. Проверь разделитель ';' и формат дат.")
+        raise RuntimeError(
+            "Не удалось прочитать ни один CSV. Проверь разделитель ';' и формат дат."
+        )
 
-    # Ищем, где лежат EURUSD/USDKZT и где лежат market indicators
     fx_df = None
     market_df = None
+    fx_name = None
+    market_name = None
 
     for fname, df in loaded:
         has_eurusd = pick_col(df, "EURUSD") is not None
         has_usdkzt = pick_col(df, "USDKZT") is not None
         has_dxy = pick_col(df, "DXY") is not None
 
-        # FX файл: есть EURUSD и USDKZT
         if fx_df is None and has_eurusd and has_usdkzt:
             fx_df = df
             fx_name = fname
 
-        # Market файл: есть DXY и BRENT (или VIX/SP500)
         if market_df is None and has_dxy:
             market_df = df
             market_name = fname
 
     if fx_df is None:
-        raise RuntimeError("Не найден файл с EURUSD и USDKZT. Убедись, что fx_multimodal_dataset_2010_present.csv лежит в этой папке.")
+        raise RuntimeError(
+            "Не найден файл с EURUSD и USDKZT. Убедись, что FX dataset лежит в этой папке."
+        )
+
     if market_df is None:
-        raise RuntimeError("Не найден файл с DXY (market indicators). Убедись, что market dataset сохранён в CSV в этой папке.")
+        raise RuntimeError(
+            "Не найден файл с DXY. Убедись, что market dataset лежит в этой папке."
+        )
 
     print("FX source:", fx_name)
     print("Market source:", market_name)
 
-    # Собираем core из FX
+    # FX-часть
     fx_cols = {}
     for logical in ["EURUSD", "USDKZT"]:
         real = pick_col(fx_df, logical)
         if real is None:
-            raise RuntimeError(f"В FX датасете нет колонки {logical}. Доступные колонки: {list(fx_df.columns)[:20]} ...")
+            raise RuntimeError(
+                f"В FX датасете нет колонки {logical}. "
+                f"Доступные колонки: {list(fx_df.columns)[:20]}"
+            )
         fx_cols[logical] = real
 
     core_fx = fx_df[list(fx_cols.values())].rename(columns={v: k for k, v in fx_cols.items()})
 
-    # Собираем core из Market
+    # Добавляем кросс-курс
+    core_fx["EURKZT"] = core_fx["EURUSD"] * core_fx["USDKZT"]
+
+    # Market-часть
     market_needed = ["DXY", "BRENT", "VIX"]
     market_cols = {}
+
     for logical in market_needed:
         real = pick_col(market_df, logical)
         if real is not None:
@@ -116,31 +131,29 @@ def main():
     if "DXY" not in market_cols or "BRENT" not in market_cols:
         raise RuntimeError(
             "В market датасете должны быть хотя бы DXY и BRENT. "
-            f"Найдено: {market_cols}. Проверь названия колонок в market CSV."
+            f"Найдено: {market_cols}. Проверь названия колонок."
         )
 
     core_mkt = market_df[list(market_cols.values())].rename(columns={v: k for k, v in market_cols.items()})
 
-    # Объединяем по дате (inner = только пересечение дат)
+    # Объединяем по пересечению дат
     merged = core_fx.join(core_mkt, how="inner")
 
-    # Если хочешь сохранить ровно 5–6 колонок, оставим только CORE_LOGICAL которые реально есть
+    # Оставляем только нужные колонки, которые реально есть
     final_cols = [c for c in CORE_LOGICAL if c in merged.columns]
     final = merged[final_cols].copy()
 
-    # Статистика до/после
-    before_fx = fx_df.shape[1]
-    before_mkt = market_df.shape[1]
-    after = final.shape[1]
+    # Удаляем пропуски на всякий случай
+    final = final.dropna().sort_index()
 
-    final = final.sort_index()
+    # Сохраняем
     final.to_csv("fx_core_dataset.csv", sep=SEP)
     final.to_excel("fx_core_dataset.xlsx")
 
     print("\n=== DONE ===")
-    print(f"FX features before: {before_fx}")
-    print(f"Market features before: {before_mkt}")
-    print(f"Core features after preprocessing: {after}")
+    print(f"FX features before: {fx_df.shape[1]}")
+    print(f"Market features before: {market_df.shape[1]}")
+    print(f"Core features after preprocessing: {final.shape[1]}")
     print("Final columns:", final_cols)
     print("Rows:", final.shape[0])
     print(final.head())

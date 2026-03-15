@@ -6,7 +6,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
 
 SEP = ";"
-PLOT_N = 150
+PLOT_N = 80
 
 
 def add_lag_features(df: pd.DataFrame, col: str, lags=(1, 2, 3, 5, 7)):
@@ -22,11 +22,22 @@ def add_rolling_features(df: pd.DataFrame, col: str, windows=(3, 7)):
     return df
 
 
-def calc_metrics(y_true, y_pred):
+def calc_metrics_percent(y_true, y_pred):
+    """
+    Возвращает метрики в процентах:
+    - MAE_%  = MAE / mean(y_true) * 100
+    - RMSE_% = RMSE / mean(y_true) * 100
+    - MAPE_% = mean(abs((y_true - y_pred) / y_true)) * 100
+    """
     mae = mean_absolute_error(y_true, y_pred)
     rmse = math.sqrt(mean_squared_error(y_true, y_pred))
-    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-    return mae, rmse, mape
+    mean_true = np.mean(y_true)
+
+    mae_pct = (mae / mean_true) * 100 if mean_true != 0 else np.nan
+    rmse_pct = (rmse / mean_true) * 100 if mean_true != 0 else np.nan
+    mape_pct = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+    return mae_pct, rmse_pct, mape_pct
 
 
 # =========================
@@ -110,9 +121,9 @@ actual_usd_next = test["actual_usd_next"].values
 # 6. Модели
 # =========================
 model_eur = CatBoostRegressor(
-    iterations=800,
-    depth=6,
-    learning_rate=0.03,
+    iterations=1500,
+    depth=8,
+    learning_rate=0.01,
     loss_function="RMSE",
     eval_metric="RMSE",
     random_seed=42,
@@ -164,33 +175,33 @@ naive_eur_next = current_eur_test.copy()
 naive_usd_next = current_usd_test.copy()
 
 # =========================
-# 10. Метрики
+# 10. Метрики в процентах
 # =========================
-mae_eur, rmse_eur, mape_eur = calc_metrics(actual_eur_next, pred_eur_next)
-mae_usd, rmse_usd, mape_usd = calc_metrics(actual_usd_next, pred_usd_next)
+mae_eur_pct, rmse_eur_pct, mape_eur_pct = calc_metrics_percent(actual_eur_next, pred_eur_next)
+mae_usd_pct, rmse_usd_pct, mape_usd_pct = calc_metrics_percent(actual_usd_next, pred_usd_next)
 
-mae_eur_naive, rmse_eur_naive, mape_eur_naive = calc_metrics(actual_eur_next, naive_eur_next)
-mae_usd_naive, rmse_usd_naive, mape_usd_naive = calc_metrics(actual_usd_next, naive_usd_next)
+mae_eur_naive_pct, rmse_eur_naive_pct, mape_eur_naive_pct = calc_metrics_percent(actual_eur_next, naive_eur_next)
+mae_usd_naive_pct, rmse_usd_naive_pct, mape_usd_naive_pct = calc_metrics_percent(actual_usd_next, naive_usd_next)
 
-print("=== CatBoost metrics: EUR/KZT ===")
-print("MAE:", mae_eur)
-print("RMSE:", rmse_eur)
-print("MAPE:", mape_eur)
+print("=== CatBoost metrics (%): EUR/KZT ===")
+print("MAE (%):", mae_eur_pct)
+print("RMSE (%):", rmse_eur_pct)
+print("MAPE (%):", mape_eur_pct)
 
-print("\n=== Naive baseline: EUR/KZT ===")
-print("MAE:", mae_eur_naive)
-print("RMSE:", rmse_eur_naive)
-print("MAPE:", mape_eur_naive)
+print("\n=== Naive baseline (%): EUR/KZT ===")
+print("MAE (%):", mae_eur_naive_pct)
+print("RMSE (%):", rmse_eur_naive_pct)
+print("MAPE (%):", mape_eur_naive_pct)
 
-print("\n=== CatBoost metrics: USD/KZT ===")
-print("MAE:", mae_usd)
-print("RMSE:", rmse_usd)
-print("MAPE:", mape_usd)
+print("\n=== CatBoost metrics (%): USD/KZT ===")
+print("MAE (%):", mae_usd_pct)
+print("RMSE (%):", rmse_usd_pct)
+print("MAPE (%):", mape_usd_pct)
 
-print("\n=== Naive baseline: USD/KZT ===")
-print("MAE:", mae_usd_naive)
-print("RMSE:", rmse_usd_naive)
-print("MAPE:", mape_usd_naive)
+print("\n=== Naive baseline (%): USD/KZT ===")
+print("MAE (%):", mae_usd_naive_pct)
+print("RMSE (%):", rmse_usd_naive_pct)
+print("MAPE (%):", mape_usd_naive_pct)
 
 # =========================
 # 11. Сохранение прогнозов
@@ -266,9 +277,44 @@ print(importance_eur.head(10))
 print("\nTop-10 important features for USD/KZT:")
 print(importance_usd.head(10))
 
+# =========================
+# 15. Текстовая сводка результатов
+# =========================
+summary_text = f"""
+=== CatBoost metrics (%): EUR/KZT ===
+MAE (%): {mae_eur_pct:.6f}
+RMSE (%): {rmse_eur_pct:.6f}
+MAPE (%): {mape_eur_pct:.6f}
+
+=== Naive baseline (%): EUR/KZT ===
+MAE (%): {mae_eur_naive_pct:.6f}
+RMSE (%): {rmse_eur_naive_pct:.6f}
+MAPE (%): {mape_eur_naive_pct:.6f}
+
+=== CatBoost metrics (%): USD/KZT ===
+MAE (%): {mae_usd_pct:.6f}
+RMSE (%): {rmse_usd_pct:.6f}
+MAPE (%): {mape_usd_pct:.6f}
+
+=== Naive baseline (%): USD/KZT ===
+MAE (%): {mae_usd_naive_pct:.6f}
+RMSE (%): {rmse_usd_naive_pct:.6f}
+MAPE (%): {mape_usd_naive_pct:.6f}
+
+=== Top-10 important features for EUR/KZT ===
+{importance_eur.head(10).to_string(index=False)}
+
+=== Top-10 important features for USD/KZT ===
+{importance_usd.head(10).to_string(index=False)}
+""".strip()
+
+with open("results_summary_catboost.txt", "w", encoding="utf-8") as f:
+    f.write(summary_text)
+
 print("\nСохранены файлы:")
 print("- catboost_eurkzt_prediction.png")
 print("- catboost_usdkzt_prediction.png")
 print("- catboost_predictions.csv")
 print("- feature_importance_eurkzt.csv")
 print("- feature_importance_usdkzt.csv")
+print("- results_summary.txt")

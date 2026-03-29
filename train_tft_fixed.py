@@ -1,4 +1,3 @@
-
 import math
 import copy
 import random
@@ -28,6 +27,8 @@ EARLY_STOPPING_PATIENCE = 12
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+plt.style.use("seaborn-v0_8-whitegrid")
+
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -37,11 +38,22 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-def calc_metrics(y_true, y_pred):
+def calc_metrics_percent(y_true, y_pred):
+    """
+    Возвращает метрики в процентах:
+    - MAE_%  = MAE / mean(y_true) * 100
+    - RMSE_% = RMSE / mean(y_true) * 100
+    - MAPE_% = mean(abs((y_true - y_pred) / y_true)) * 100
+    """
     mae = mean_absolute_error(y_true, y_pred)
     rmse = math.sqrt(mean_squared_error(y_true, y_pred))
-    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-    return mae, rmse, mape
+    mean_true = np.mean(y_true)
+
+    mae_pct = (mae / mean_true) * 100 if mean_true != 0 else np.nan
+    rmse_pct = (rmse / mean_true) * 100 if mean_true != 0 else np.nan
+    mape_pct = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+    return mae_pct, rmse_pct, mape_pct
 
 
 def add_lag_features(df: pd.DataFrame, col: str, lags=(1, 2, 3, 5, 7, 14)):
@@ -58,6 +70,60 @@ def add_rolling_features(df: pd.DataFrame, col: str, windows=(3, 7, 14, 30)):
         df[f"{col}_min{w}"] = roll.min()
         df[f"{col}_max{w}"] = roll.max()
     return df
+
+
+def plot_forecast(dates, actual, predicted, naive, title, ylabel, filename, n_last=150, metrics_text=None):
+    dates = dates.iloc[-n_last:]
+    actual = actual[-n_last:]
+    predicted = predicted[-n_last:]
+    naive = naive[-n_last:]
+
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
+
+    ax.plot(
+        dates, actual,
+        label="Actual",
+        linewidth=2.6,
+        color="#1f3b73"
+    )
+    ax.plot(
+        dates, predicted,
+        label="TFT forecast",
+        linewidth=2.2,
+        color="#d62728"
+    )
+    ax.plot(
+        dates, naive,
+        label="Naive baseline",
+        linewidth=1.8,
+        linestyle="--",
+        color="#7f7f7f"
+    )
+
+    ax.set_title(title, fontsize=15, fontweight="bold", pad=14)
+    ax.set_xlabel("Date", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+
+    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="best", frameon=True, fancybox=True, shadow=False, fontsize=10)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    if metrics_text is not None:
+        ax.text(
+            0.98, 0.02, metrics_text,
+            transform=ax.transAxes,
+            fontsize=10,
+            verticalalignment="bottom",
+            horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9, edgecolor="gray")
+        )
+
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(filename, bbox_inches="tight")
+    plt.close()
 
 
 class OneStepDataset(Dataset):
@@ -412,20 +478,22 @@ def run_target(df, feature_cols, target_col, current_col, actual_next_col, label
     model = train_one_model(model, train_loader, val_loader, EPOCHS, LR)
 
     pred_next, naive_next, actual_next_test, pred_logret = predict_levels(model, test_loader)
-    mae, rmse, mape = calc_metrics(actual_next_test, pred_next)
-    mae_n, rmse_n, mape_n = calc_metrics(actual_next_test, naive_next)
+
+    mae_pct, rmse_pct, mape_pct = calc_metrics_percent(actual_next_test, pred_next)
+    mae_n_pct, rmse_n_pct, mape_n_pct = calc_metrics_percent(actual_next_test, naive_next)
 
     test_indices = test_loader.dataset.indices
     test_dates = df["Date"].iloc[test_indices].reset_index(drop=True)
 
-    print(f"\n=== TFT metrics: {label_prefix} ===")
-    print("MAE:", mae)
-    print("RMSE:", rmse)
-    print("MAPE:", mape)
-    print(f"\n=== Naive baseline: {label_prefix} ===")
-    print("MAE:", mae_n)
-    print("RMSE:", rmse_n)
-    print("MAPE:", mape_n)
+    print(f"\n=== TFT metrics (%): {label_prefix} ===")
+    print("MAE (%):", mae_pct)
+    print("RMSE (%):", rmse_pct)
+    print("MAPE (%):", mape_pct)
+
+    print(f"\n=== Naive baseline (%): {label_prefix} ===")
+    print("MAE (%):", mae_n_pct)
+    print("RMSE (%):", rmse_n_pct)
+    print("MAPE (%):", mape_n_pct)
 
     return {
         "model": model,
@@ -434,13 +502,14 @@ def run_target(df, feature_cols, target_col, current_col, actual_next_col, label
         "actual_next": actual_next_test,
         "pred_logret": pred_logret,
         "test_dates": test_dates,
-        "metrics": (mae, rmse, mape),
-        "naive_metrics": (mae_n, rmse_n, mape_n),
+        "metrics": (mae_pct, rmse_pct, mape_pct),
+        "naive_metrics": (mae_n_pct, rmse_n_pct, mape_n_pct),
     }
 
 
 def main():
     set_seed(SEED)
+
     df = pd.read_csv("fx_core_dataset.csv", sep=SEP, index_col=0)
     df.index = pd.to_datetime(df.index)
     df.index.name = "Date"
@@ -451,6 +520,9 @@ def main():
     eur_res = run_target(df, feature_cols, "target_eur_logret", "EURKZT", "actual_eur_next", "EUR/KZT")
     usd_res = run_target(df, feature_cols, "target_usd_logret", "USDKZT", "actual_usd_next", "USD/KZT")
 
+    # =========================
+    # 1. Сохранение прогнозов
+    # =========================
     results = pd.DataFrame({
         "Date": eur_res["test_dates"].values,
         "Actual_EURKZT_Next": eur_res["actual_next"],
@@ -464,33 +536,80 @@ def main():
     })
     results.to_csv("tft_predictions_real.csv", sep=SEP, index=False)
 
-    plot_dates = eur_res["test_dates"].iloc[-PLOT_N:]
+    # =========================
+    # 2. Красивые графики
+    # =========================
+    eur_mae, eur_rmse, eur_mape = eur_res["metrics"]
+    usd_mae, usd_rmse, usd_mape = usd_res["metrics"]
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(plot_dates, eur_res["actual_next"][-PLOT_N:], label="Actual EUR/KZT")
-    plt.plot(plot_dates, eur_res["pred_next"][-PLOT_N:], label="Predicted EUR/KZT")
-    plt.plot(plot_dates, eur_res["naive_next"][-PLOT_N:], label="Naive EUR/KZT", linestyle="--")
-    plt.title("Real TFT Forecast: EUR/KZT")
-    plt.xlabel("Date")
-    plt.ylabel("EUR/KZT")
-    plt.legend()
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    plt.savefig("tft_real_eurkzt_prediction.png")
-    plt.close()
+    plot_forecast(
+        dates=eur_res["test_dates"],
+        actual=eur_res["actual_next"],
+        predicted=eur_res["pred_next"],
+        naive=eur_res["naive_next"],
+        title="Temporal Fusion Transformer Forecast for EUR/KZT",
+        ylabel="Exchange Rate",
+        filename="tft_real_eurkzt_prediction.png",
+        n_last=PLOT_N,
+        metrics_text=(
+            f"MAE: {eur_mae:.3f}%\n"
+            f"RMSE: {eur_rmse:.3f}%\n"
+            f"MAPE: {eur_mape:.3f}%"
+        )
+    )
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(plot_dates, usd_res["actual_next"][-PLOT_N:], label="Actual USD/KZT")
-    plt.plot(plot_dates, usd_res["pred_next"][-PLOT_N:], label="Predicted USD/KZT")
-    plt.plot(plot_dates, usd_res["naive_next"][-PLOT_N:], label="Naive USD/KZT", linestyle="--")
-    plt.title("Real TFT Forecast: USD/KZT")
-    plt.xlabel("Date")
-    plt.ylabel("USD/KZT")
-    plt.legend()
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    plt.savefig("tft_real_usdkzt_prediction.png")
-    plt.close()
+    plot_forecast(
+        dates=usd_res["test_dates"],
+        actual=usd_res["actual_next"],
+        predicted=usd_res["pred_next"],
+        naive=usd_res["naive_next"],
+        title="Temporal Fusion Transformer Forecast for USD/KZT",
+        ylabel="Exchange Rate",
+        filename="tft_real_usdkzt_prediction.png",
+        n_last=PLOT_N,
+        metrics_text=(
+            f"MAE: {usd_mae:.3f}%\n"
+            f"RMSE: {usd_rmse:.3f}%\n"
+            f"MAPE: {usd_mape:.3f}%"
+        )
+    )
+
+    # =========================
+    # 3. Текстовая сводка результатов
+    # =========================
+    eur_mae_n, eur_rmse_n, eur_mape_n = eur_res["naive_metrics"]
+    usd_mae_n, usd_rmse_n, usd_mape_n = usd_res["naive_metrics"]
+
+    summary_text = f"""
+=== TFT metrics (%): EUR/KZT ===
+MAE (%): {eur_mae:.6f}
+RMSE (%): {eur_rmse:.6f}
+MAPE (%): {eur_mape:.6f}
+
+=== Naive baseline (%): EUR/KZT ===
+MAE (%): {eur_mae_n:.6f}
+RMSE (%): {eur_rmse_n:.6f}
+MAPE (%): {eur_mape_n:.6f}
+
+=== TFT metrics (%): USD/KZT ===
+MAE (%): {usd_mae:.6f}
+RMSE (%): {usd_rmse:.6f}
+MAPE (%): {usd_mape:.6f}
+
+=== Naive baseline (%): USD/KZT ===
+MAE (%): {usd_mae_n:.6f}
+RMSE (%): {usd_rmse_n:.6f}
+MAPE (%): {usd_mape_n:.6f}
+""".strip()
+
+    with open("results_summary_tft.txt", "w", encoding="utf-8") as f:
+        f.write(summary_text)
+
+    print("\nСохранены файлы:")
+    print("- tft_real_eurkzt_prediction.png")
+    print("- tft_real_usdkzt_prediction.png")
+    print("- tft_predictions_real.csv")
+    print("- results_summary_tft.txt")
 
 
 if __name__ == "__main__":

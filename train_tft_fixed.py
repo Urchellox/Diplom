@@ -9,12 +9,12 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 
 SEP = ";"
 SEED = 42
-WINDOW = 64
+WINDOW = 90
 BATCH_SIZE = 64
 EPOCHS = 60
 LR = 1e-3
@@ -52,8 +52,9 @@ def calc_metrics_percent(y_true, y_pred):
     mae_pct = (mae / mean_true) * 100 if mean_true != 0 else np.nan
     rmse_pct = (rmse / mean_true) * 100 if mean_true != 0 else np.nan
     mape_pct = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    r2 = r2_score(y_true, y_pred)
 
-    return mae_pct, rmse_pct, mape_pct
+    return mae_pct, rmse_pct, mape_pct, r2
 
 
 def add_lag_features(df: pd.DataFrame, col: str, lags=(1, 2, 3, 5, 7, 14)):
@@ -62,13 +63,11 @@ def add_lag_features(df: pd.DataFrame, col: str, lags=(1, 2, 3, 5, 7, 14)):
     return df
 
 
-def add_rolling_features(df: pd.DataFrame, col: str, windows=(3, 7, 14, 30)):
+def add_rolling_features(df: pd.DataFrame, col: str, windows=(3, 7, 14)):
     for w in windows:
         roll = df[col].rolling(w)
         df[f"{col}_ma{w}"] = roll.mean()
         df[f"{col}_std{w}"] = roll.std()
-        df[f"{col}_min{w}"] = roll.min()
-        df[f"{col}_max{w}"] = roll.max()
     return df
 
 
@@ -125,14 +124,34 @@ def plot_forecast(dates, actual, predicted, naive, title, ylabel, filename, n_la
     plt.savefig(filename, bbox_inches="tight")
     plt.close()
 
+def plot_r2_progress(actual, predicted, filename):
+    r2_vals = []
+    steps = []
+
+    for i in range(30, len(actual)):
+        r2 = r2_score(actual[:i], predicted[:i])
+        r2_vals.append(r2)
+        steps.append(i)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(steps, r2_vals)
+    plt.title("R2 Score Progress (TFT)")
+    plt.xlabel("Samples")
+    plt.ylabel("R2")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
 
 class OneStepDataset(Dataset):
-    def __init__(self, values, target_logret, current_level, actual_next, start_idx, end_idx, window):
+    def __init__(self, values, target, current_level, actual_next, start_idx, end_idx, window):
         self.values = values
-        self.target_logret = target_logret
+        self.target = target
         self.current_level = current_level
         self.actual_next = actual_next
         self.window = window
+
         self.indices = np.arange(max(start_idx, window - 1), end_idx)
 
     def __len__(self):
@@ -140,10 +159,12 @@ class OneStepDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        x = self.values[idx - self.window + 1: idx + 1]  # include current time t
-        y = self.target_logret[idx]  # target for t -> t+1
+
+        x = self.values[idx - self.window + 1: idx + 1]
+        y = self.target[idx]
         current = self.current_level[idx]
         actual = self.actual_next[idx]
+
         return (
             torch.tensor(x, dtype=torch.float32),
             torch.tensor(y, dtype=torch.float32),
@@ -379,7 +400,7 @@ def train_one_model(model, train_loader, val_loader, epochs, lr):
 
 def predict_levels(model, loader):
     model.eval()
-    pred_logret = []
+    pred_delta = []
     current_levels = []
     actual_next_levels = []
 
@@ -389,17 +410,17 @@ def predict_levels(model, loader):
             pred_q, _, _ = model(xb)
             pred_median = pred_q[:, 1].cpu().numpy()
 
-            pred_logret.extend(pred_median)
+            pred_delta.extend(pred_median)
             current_levels.extend(current.numpy())
             actual_next_levels.extend(actual_next.numpy())
 
-    pred_logret = np.array(pred_logret)
+    pred_delta = np.array(pred_delta)
     current_levels = np.array(current_levels)
     actual_next_levels = np.array(actual_next_levels)
 
-    pred_next_levels = current_levels * np.exp(pred_logret)
+    pred_next_levels = current_levels + pred_delta
     naive_next_levels = current_levels.copy()
-    return pred_next_levels, naive_next_levels, actual_next_levels, pred_logret
+    return pred_next_levels, naive_next_levels, actual_next_levels, pred_delta
 
 
 def build_feature_frame(df: pd.DataFrame):
@@ -413,7 +434,6 @@ def build_feature_frame(df: pd.DataFrame):
         df[f"{col}_ret1"] = df[col].pct_change(1)
         df[f"{col}_ret3"] = df[col].pct_change(3)
         df[f"{col}_ret5"] = df[col].pct_change(5)
-        df[f"{col}_log"] = np.log(df[col])
 
     # calendar features
     df["day_of_week"] = df["Date"].dt.dayofweek
@@ -427,16 +447,17 @@ def build_feature_frame(df: pd.DataFrame):
     df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
     df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
-    df["target_eur_logret"] = np.log(df["EURKZT"].shift(-1) / df["EURKZT"])
-    df["target_usd_logret"] = np.log(df["USDKZT"].shift(-1) / df["USDKZT"])
-    df["actual_eur_next"] = df["EURKZT"].shift(-1)
-    df["actual_usd_next"] = df["USDKZT"].shift(-1)
+    df["target_eur_delta"] = df["EURKZT"].shift(-3) - df["EURKZT"]
+    df["target_usd_delta"] = df["USDKZT"].shift(-3) - df["USDKZT"]
+
+    df["actual_eur_next"] = df["EURKZT"].shift(-3)
+    df["actual_usd_next"] = df["USDKZT"].shift(-3)
     df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
 
     feature_cols = [
         c for c in df.columns
         if c not in {
-            "Date", "target_eur_logret", "target_usd_logret", "actual_eur_next", "actual_usd_next"
+            "Date", "target_eur_delta", "target_usd_delta", "actual_eur_next", "actual_usd_next"
         }
     ]
     return df, feature_cols
@@ -469,7 +490,7 @@ def run_target(df, feature_cols, target_col, current_col, actual_next_col, label
         num_features=len(feature_cols),
         hidden_size=HIDDEN_SIZE,
         lstm_layers=1,
-        num_heads=4,
+        num_heads=8,
         dropout=DROPOUT,
         quantiles=TARGET_QUANTILES,
     ).to(device)
@@ -479,9 +500,9 @@ def run_target(df, feature_cols, target_col, current_col, actual_next_col, label
 
     pred_next, naive_next, actual_next_test, pred_logret = predict_levels(model, test_loader)
 
-    mae_pct, rmse_pct, mape_pct = calc_metrics_percent(actual_next_test, pred_next)
-    mae_n_pct, rmse_n_pct, mape_n_pct = calc_metrics_percent(actual_next_test, naive_next)
-
+    mae_pct, rmse_pct, mape_pct, r2 = calc_metrics_percent(actual_next_test, pred_next)
+    mae_n_pct, rmse_n_pct, mape_n_pct, r2_naive = calc_metrics_percent(actual_next_test, naive_next)
+    
     test_indices = test_loader.dataset.indices
     test_dates = df["Date"].iloc[test_indices].reset_index(drop=True)
 
@@ -489,11 +510,13 @@ def run_target(df, feature_cols, target_col, current_col, actual_next_col, label
     print("MAE (%):", mae_pct)
     print("RMSE (%):", rmse_pct)
     print("MAPE (%):", mape_pct)
+    print("R2:", r2)
 
     print(f"\n=== Naive baseline (%): {label_prefix} ===")
     print("MAE (%):", mae_n_pct)
     print("RMSE (%):", rmse_n_pct)
     print("MAPE (%):", mape_n_pct)
+    print("Naive R2:", r2_naive)
 
     return {
         "model": model,
@@ -502,8 +525,8 @@ def run_target(df, feature_cols, target_col, current_col, actual_next_col, label
         "actual_next": actual_next_test,
         "pred_logret": pred_logret,
         "test_dates": test_dates,
-        "metrics": (mae_pct, rmse_pct, mape_pct),
-        "naive_metrics": (mae_n_pct, rmse_n_pct, mape_n_pct),
+        "metrics": (mae_pct, rmse_pct, mape_pct, r2),
+        "naive_metrics": (mae_n_pct, rmse_n_pct, mape_n_pct, r2_naive),
     }
 
 
@@ -517,8 +540,8 @@ def main():
 
     df, feature_cols = build_feature_frame(df)
 
-    eur_res = run_target(df, feature_cols, "target_eur_logret", "EURKZT", "actual_eur_next", "EUR/KZT")
-    usd_res = run_target(df, feature_cols, "target_usd_logret", "USDKZT", "actual_usd_next", "USD/KZT")
+    eur_res = run_target(df, feature_cols, "target_eur_delta", "EURKZT", "actual_eur_next", "EUR/KZT")
+    usd_res = run_target(df, feature_cols, "target_usd_delta", "USDKZT", "actual_usd_next", "USD/KZT")
 
     # =========================
     # 1. Сохранение прогнозов
@@ -539,8 +562,8 @@ def main():
     # =========================
     # 2. Красивые графики
     # =========================
-    eur_mae, eur_rmse, eur_mape = eur_res["metrics"]
-    usd_mae, usd_rmse, usd_mape = usd_res["metrics"]
+    eur_mae, eur_rmse, eur_mape, eur_r2 = eur_res["metrics"]
+    usd_mae, usd_rmse, usd_mape, usd_r2 = usd_res["metrics"]
 
     plot_forecast(
         dates=eur_res["test_dates"],
@@ -554,7 +577,8 @@ def main():
         metrics_text=(
             f"MAE: {eur_mae:.3f}%\n"
             f"RMSE: {eur_rmse:.3f}%\n"
-            f"MAPE: {eur_mape:.3f}%"
+            f"MAPE: {eur_mape:.3f}%\n"
+            f"R2: {eur_r2:.4f}%\n"
         )
     )
 
@@ -570,9 +594,23 @@ def main():
         metrics_text=(
             f"MAE: {usd_mae:.3f}%\n"
             f"RMSE: {usd_rmse:.3f}%\n"
-            f"MAPE: {usd_mape:.3f}%"
+            f"MAPE: {usd_mape:.3f}%\n"
+            f"R2: {usd_r2:.4f}"
         )
     )
+
+    plot_r2_progress(
+        eur_res["actual_next"],
+        eur_res["pred_next"],
+        "tft_r2_eurkzt.png"
+    )
+
+    plot_r2_progress(
+        usd_res["actual_next"],
+        usd_res["pred_next"],
+        "tft_r2_usdkzt.png"
+    )
+    
 
     # =========================
     # 3. Текстовая сводка результатов
